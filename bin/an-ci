@@ -1,0 +1,5 @@
+#!/bin/bash
+ENV_PATH="`dirname "$0"`/.."
+
+. "${ENV_PATH}/.env/bin/activate"
+python "${ENV_PATH}/an-ci.py" "$@"
