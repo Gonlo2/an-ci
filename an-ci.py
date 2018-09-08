@@ -18,8 +18,6 @@ def docker_constructor(loader, node):
         'docker-compose',
         'exec',
         '-T',
-        '--user',
-        '{}:{}'.format(os.getuid(), os.getgid()),
         node.value
     ]
 
@@ -36,9 +34,13 @@ def eprint(text, *args, **kwargs):
 def call_command(command):
     command_it = _unroll(command)
     command = next(command_it)
-    for l in sh.Command(command)(*command_it, _bg=True, _iter=True, _err_to_out=True):
-        sys.stdout.write(l)
+    try:
+        for l in sh.Command(command)(*command_it, _bg_exc=False, _iter=True, _err_to_out=True):
+            sys.stdout.write(l)
+    except sh.ErrorReturnCode as e:
+        return e.exit_code
 
+    return 0
 
 def _unroll(args):
     for arg in args:
@@ -55,11 +57,16 @@ def main(argv):
 
     eprint("* Running workflow: {} *", workflow_id)
     for task_id in data['workflows'][workflow_id]:
-        eprint("** Running task: {} **", task_id)
+        eprint("\n** Running task: {} **", task_id)
         task = data['tasks'][task_id]
         for command in task:
-            call_command(command)
+            exit_code = call_command(command)
+            if exit_code != 0:
+                eprint("** ERROR: The task exit with a exit code: {}", exit_code)
+                return 1
 
+    return 0
 
 if __name__ == "__main__":
-    main(sys.argv)
+    exit_code = main(sys.argv)
+    sys.exit(exit_code)
