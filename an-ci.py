@@ -4,6 +4,7 @@ import yaml
 import sh
 import sys
 import os
+import getpass
 import shellescape
 
 def env_constructor(loader, node):
@@ -29,17 +30,35 @@ class DockerTask(object):
 
     def execute(self):
         try:
+            user_name = getpass.getuser()
+            uid = os.getuid()
+            gid = os.getgid()
+
+            self._execute(
+                'bash',
+                _in=self._make_create_user_script(
+                    user_name,
+                    uid,
+                    gid
+                )
+            )
+
             command = self._execute(
                 'bash',
                 _iter=True,
-                _in=self._make_bash()
+                _in=self._make_bash(),
+                _user='{}:{}'.format(uid, gid)
             )
             command_it = iter(command)
             parent_pid = int(next(command_it))
             while True:
                 try:
                     for l in command_it:
-                        sys.stdout.write(l)
+                        if isinstance(l, bytes):
+                            sys.stdout.buffer.write(l)
+                        else:
+                            sys.stdout.write(l)
+
                         sys.stdout.flush()
                     return 0
                 except KeyboardInterrupt:
@@ -56,7 +75,8 @@ class DockerTask(object):
             command,
             *args,
             _iter=False,
-            _in=None
+            _in=None,
+            _user=None,
     ):
         if self._verbose:
             eprint(
@@ -65,17 +85,39 @@ class DockerTask(object):
                 command,
                 ' '.join(args)
             )
+
+        docker_compose_args = ['exec', '-T']
+
+        if _user is not None:
+            docker_compose_args.append('--user')
+            docker_compose_args.append(_user)
+
+        docker_compose_args.append(self._image)
+        docker_compose_args.append(command)
+        docker_compose_args.extend(args)
+
         return sh.Command('docker-compose')(
-            'exec',
-            '-T',
-            self._image,
-            command,
-            *args,
+            *docker_compose_args,
             _bg_exc=not _iter,
             _iter=_iter,
             _err_to_out=True,
             _in=_in
         )
+
+    def _make_create_user_script(self, user_name, uid, gid):
+        return """#!/bin/bash
+id -u {user_name}
+if [ $? != 0 ]; then
+  set -e
+  groupadd --gid {gid} {user_name}
+  useradd --uid {uid} --gid {gid} --create-home {user_name}
+  echo "{user_name}    ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+fi
+""".format(
+    user_name=user_name,
+    uid=uid,
+    gid=gid
+)
 
     def _make_bash(self):
         commands = [
@@ -86,11 +128,11 @@ class DockerTask(object):
         return """#!/bin/bash
 echo $$
 sleep 1
-set -e{}
+set -e{verbose}
 
-{}""".format(
-    'x' if self._verbose else '',
-    '\n'.join(commands)
+{command}""".format(
+    verbose='x' if self._verbose else '',
+    command='\n'.join(commands)
 )
 
 
