@@ -34,23 +34,7 @@ class DockerTask(object):
 
     def execute(self):
         try:
-            user = None
-
-            if not self._default_user:
-                user_name = getpass.getuser()
-                uid = os.getuid()
-                gid = os.getgid()
-
-                self._execute(
-                    'bash',
-                    _in=self._make_create_user_script(
-                        user_name,
-                        uid,
-                        gid
-                    )
-                )
-
-                user = '{}:{}'.format(uid, gid)
+            user = self._prepare_user()
 
             in_queue = self._make_bash()
             command = self._execute(
@@ -75,6 +59,26 @@ class DockerTask(object):
                     in_queue.put("\x03") # Ctrl-C code
         except sh.ErrorReturnCode as e:
             return e.exit_code
+
+
+    def _prepare_user(self):
+        if self._default_user: return None
+
+        user_name = getpass.getuser()
+        uid = os.getuid()
+        gid = os.getgid()
+
+        self._execute(
+            'bash',
+            _in=self._make_create_user_script(
+                user_name,
+                uid,
+                gid
+            )
+        )
+
+        return '{}:{}'.format(uid, gid)
+
 
     def _execute(
             self,
@@ -171,6 +175,10 @@ def eprint(text, *args, **kwargs):
 
 def execute_task(task, cwd=None):
     if isinstance(task, DockerTask):
+        exit_code = call_command(['docker-compose', 'up', '-d'], cwd=cwd)
+        if exit_code != 0:
+            return exit_code
+
         return task.execute()
     else:
         for command in task:
