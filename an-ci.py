@@ -6,6 +6,9 @@ import sys
 import os
 import getpass
 import shellescape
+import queue
+
+_CI_FILE = '.ci.yaml'
 
 def env_constructor(loader, node):
     env = {}
@@ -21,36 +24,43 @@ def docker_constructor(loader, node):
 
 
 class DockerTask(object):
-    def __init__(self, image, commands):
+    def __init__(self, image, commands, default_user=False):
         super(DockerTask, self).__init__()
         self._image = image
         self._commands = commands
+        self._default_user = default_user
 
         self._verbose = True
 
     def execute(self):
         try:
-            user_name = getpass.getuser()
-            uid = os.getuid()
-            gid = os.getgid()
+            user = None
 
-            self._execute(
-                'bash',
-                _in=self._make_create_user_script(
-                    user_name,
-                    uid,
-                    gid
+            if not self._default_user:
+                user_name = getpass.getuser()
+                uid = os.getuid()
+                gid = os.getgid()
+
+                self._execute(
+                    'bash',
+                    _in=self._make_create_user_script(
+                        user_name,
+                        uid,
+                        gid
+                    )
                 )
-            )
 
+                user = '{}:{}'.format(uid, gid)
+
+            in_queue = self._make_bash()
             command = self._execute(
                 'bash',
                 _iter=True,
-                _in=self._make_bash(),
-                _user='{}:{}'.format(uid, gid)
+                _in=in_queue,
+                _user=user,
+                _tty_in=True
             )
             command_it = iter(command)
-            parent_pid = int(next(command_it))
             while True:
                 try:
                     for l in command_it:
@@ -62,11 +72,7 @@ class DockerTask(object):
                         sys.stdout.flush()
                     return 0
                 except KeyboardInterrupt:
-                    self._execute(
-                        'kill',
-                        '-9',
-                        '-{}'.format(parent_pid)
-                    )
+                    in_queue.put("\x03") # Ctrl-C code
         except sh.ErrorReturnCode as e:
             return e.exit_code
 
@@ -77,6 +83,7 @@ class DockerTask(object):
             _iter=False,
             _in=None,
             _user=None,
+            _tty_in=False
     ):
         if self._verbose:
             eprint(
@@ -86,7 +93,8 @@ class DockerTask(object):
                 ' '.join(args)
             )
 
-        docker_compose_args = ['exec', '-T']
+        docker_compose_args = ['exec']
+        if not _tty_in: docker_compose_args.append('-T')
 
         if _user is not None:
             docker_compose_args.append('--user')
@@ -101,6 +109,7 @@ class DockerTask(object):
             _bg_exc=not _iter,
             _iter=_iter,
             _err_to_out=True,
+            _tty_in=_tty_in,
             _in=_in
         )
 
@@ -120,20 +129,16 @@ fi
 )
 
     def _make_bash(self):
-        commands = [
-            ' '.join(shellescape.quote(str(x)) for x in _unroll(command))
-            for command in self._commands
-        ]
+        in_queue = queue.Queue()
+        in_queue.put("'set' '-e'\n")
 
-        return """#!/bin/bash
-echo $$
-sleep 1
-set -e{verbose}
+        for command in self._commands:
+            x = ' '.join(shellescape.quote(str(x)) for x in _unroll(command))
+            in_queue.put("{}\n".format(x))
 
-{command}""".format(
-    verbose='x' if self._verbose else '',
-    command='\n'.join(commands)
-)
+        in_queue.put("'exit'\n")
+
+        return in_queue
 
 
 def isolate_command_constructor(loader, node):
@@ -146,10 +151,16 @@ def and_command_constructor(loader, node):
     return ['&&', command]
 
 
+def pipe_command_constructor(loader, node):
+    command = loader.construct_sequence(node)
+    return ['|', command]
+
+
 yaml.add_constructor('!env', env_constructor)
 yaml.add_constructor('!docker', docker_constructor)
 yaml.add_constructor('!isolate', isolate_command_constructor)
 yaml.add_constructor('!and', and_command_constructor)
+yaml.add_constructor('!pipe', pipe_command_constructor)
 
 
 def eprint(text, *args, **kwargs):
@@ -158,23 +169,35 @@ def eprint(text, *args, **kwargs):
     sys.stderr.write(str(text) + '\n')
 
 
-def execute_task(task):
+def execute_task(task, cwd=None):
     if isinstance(task, DockerTask):
         return task.execute()
     else:
         for command in task:
-            exit_code = call_command(command)
+            exit_code = call_command(command, cwd=cwd)
             if exit_code != 0:
                 return exit_code
 
     return 0
 
 
-def call_command(command):
+def call_command(command, cwd=None):
+    env = dict(os.environ)
+    if cwd is not None:
+        env['PWD'] = cwd
+
     command_it = _unroll(command)
     command = next(command_it)
     try:
-        for l in sh.Command(command)(*command_it, _bg_exc=False, _iter=True, _err_to_out=True):
+        it = sh.Command(command)(
+            *command_it,
+            _bg_exc=False,
+            _iter=True,
+            _err_to_out=True,
+            _cwd=cwd,
+            _env=env
+        )
+        for l in it:
             sys.stdout.write(l)
             sys.stdout.flush()
     except sh.ErrorReturnCode as e:
@@ -192,17 +215,41 @@ def _unroll(arg):
         yield arg
 
 
-def main(argv):
-    workflow_id = argv[1]
+def get_work_path():
+    path = os.getcwd()
+    while True:
+        if os.path.isfile(os.path.join(path, _CI_FILE)):
+            return path
+        path, head = os.path.split(path)
+        if head == '': return None
 
-    with open('.ci.yaml') as f: data = yaml.load(f)
+
+def main(argv):
+    work_path = get_work_path()
+    if work_path is None:
+        eprint("Can't found a '{}' file", _CI_FILE)
+        return -1
+
+    with open(os.path.join(work_path, _CI_FILE)) as f:
+        data = yaml.load(f)
+
+    if len(argv) <= 1:
+        eprint("Usage: an-ci <workflow>")
+        eprint("")
+        eprint("The available workflows are:")
+        for workflow in sorted(data['workflows'].keys()):
+            eprint(" - {}", workflow)
+
+        return -1
+
+    workflow_id = argv[1]
 
     eprint("* Running workflow: {} *", workflow_id)
     for task_id in data['workflows'][workflow_id]:
         eprint("\n** Running task: {} **", task_id)
         task = data['tasks'][task_id]
 
-        exit_code = execute_task(task)
+        exit_code = execute_task(task, cwd=work_path)
         if exit_code != 0:
             eprint("** ERROR: The task exit with a exit code: {}", exit_code)
             return 1
