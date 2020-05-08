@@ -7,6 +7,7 @@ import os
 import getpass
 import shellescape
 import queue
+import time
 
 _CI_FILE = '.ci.yaml'
 
@@ -39,24 +40,19 @@ class DockerTask(object):
             in_queue = self._make_bash()
             command = self._execute(
                 'bash',
-                _iter=True,
+                _realtime=True,
                 _in=in_queue,
                 _user=user,
                 _tty_in=True
             )
-            command_it = iter(command)
+
             while True:
                 try:
-                    for l in command_it:
-                        if isinstance(l, bytes):
-                            sys.stdout.buffer.write(l)
-                        else:
-                            sys.stdout.write(l)
-
-                        sys.stdout.flush()
-                    return 0
+                    command.wait()
+                    return command.exit_code
                 except KeyboardInterrupt:
                     in_queue.put("\x03") # Ctrl-C code
+                    return 1
         except sh.ErrorReturnCode as e:
             return e.exit_code
 
@@ -84,7 +80,7 @@ class DockerTask(object):
             self,
             command,
             *args,
-            _iter=False,
+            _realtime=False,
             _in=None,
             _user=None,
             _tty_in=False
@@ -108,14 +104,24 @@ class DockerTask(object):
         docker_compose_args.append(command)
         docker_compose_args.extend(args)
 
-        return sh.Command('docker-compose')(
+        kwargs = {}
+        if _realtime:
+            kwargs['_out'] = sys.stdout
+            kwargs['_err'] = sys.stderr
+
+        command = sh.Command('docker-compose')(
             *docker_compose_args,
-            _bg_exc=not _iter,
-            _iter=_iter,
-            _err_to_out=True,
             _tty_in=_tty_in,
-            _in=_in
+            _in=_in,
+            _bg_exc=False,
+            _iter=_realtime,
+            **kwargs
         )
+
+        if _realtime: return command
+
+        command.wait()
+        return command.exit_code
 
     def _make_create_user_script(self, user_name, uid, gid):
         return """#!/bin/bash
@@ -137,13 +143,12 @@ fi
         in_queue.put("'set' '-e'\n")
 
         for command in self._commands:
-            x = ' '.join(shellescape.quote(str(x)) for x in _unroll(command))
+            x = ' '.join(_escape_unroll(command))
             in_queue.put("{}\n".format(x))
 
         in_queue.put("'exit'\n")
 
         return in_queue
-
 
 def isolate_command_constructor(loader, node):
     command = loader.construct_sequence(node)
@@ -160,11 +165,20 @@ def pipe_command_constructor(loader, node):
     return ['|', command]
 
 
+class UnsafeCommand(str): pass
+
+
+def unsafe_command_constructor(loader, node):
+    command = loader.construct_scalar(node)
+    return UnsafeCommand(command)
+
+
 yaml.add_constructor('!env', env_constructor)
 yaml.add_constructor('!docker', docker_constructor)
 yaml.add_constructor('!isolate', isolate_command_constructor)
 yaml.add_constructor('!and', and_command_constructor)
 yaml.add_constructor('!pipe', pipe_command_constructor)
+yaml.add_constructor('!unsafe', unsafe_command_constructor)
 
 
 def eprint(text, *args, **kwargs):
@@ -196,22 +210,28 @@ def call_command(command, cwd=None):
 
     command_it = _unroll(command)
     command = next(command_it)
+
     try:
-        it = sh.Command(command)(
+        in_queue = queue.Queue()
+
+        command = sh.Command(command)(
             *command_it,
-            _bg_exc=False,
-            _iter=True,
-            _err_to_out=True,
             _cwd=cwd,
-            _env=env
+            _env=env,
+            _tty_in=True,
+            _out=sys.stdout,
+            _err=sys.stderr,
+            _in=in_queue
         )
-        for l in it:
-            sys.stdout.write(l)
-            sys.stdout.flush()
+
+        while True:
+            try:
+                command.wait()
+                return command.exit_code
+            except KeyboardInterrupt:
+                in_queue.put("\x03") # Ctrl-C code
     except sh.ErrorReturnCode as e:
         return e.exit_code
-
-    return 0
 
 
 def _unroll(arg):
@@ -221,6 +241,14 @@ def _unroll(arg):
                 yield y
     else:
         yield arg
+
+
+def _escape_unroll(arg):
+    for x in _unroll(arg):
+        if isinstance(x, UnsafeCommand):
+            yield x
+        else:
+            yield shellescape.quote(str(x))
 
 
 def get_work_path():
